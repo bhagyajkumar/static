@@ -1,0 +1,288 @@
+# Implementing authentication in FastAPI using JWT 
+In a client side rendering application, authentication is a bit defferent from a server side rendering application. Instead of managing session, we basically get a token from server using our username and password in a client side rendering application 
+___
+## What is a JWT?
+JWT (Json Web Token) is a nice way of managing tokens without actually storing it in a server
+
+The structure of JWT is
+```
+<Header>.<data>.<signature>
+```
+Here header has data on what hashing algorithm used.
+The data section has all the data required for validation like user id and the time issued and optionally time of expiry
+The signature section is the hash of the other two sections and a secret key
+___
+In this example we will be using tortoise-orm for database and pyjwt for implimenting authentication.
+
+Our File structure will be in this form
+
+app/
+├─ \_\_init\_\_.py
+├─ models.py
+├─ auth.py
+requirements.txt
+
+Now we need to install a few dependencies, here is my requirements.txt file copy it to your project
+```
+﻿aiosqlite==0.17.0
+anyio==3.3.4
+asgiref==3.4.1
+asyncpg==0.24.0
+autopep8==1.6.0
+bcrypt==3.2.0
+cffi==1.15.0
+click==8.0.3
+colorama==0.4.4
+cryptography==35.0.0
+ecdsa==0.17.0
+fastapi==0.70.0
+h11==0.12.0
+idna==3.3
+iso8601==0.1.16
+passlib==1.7.4
+pyasn1==0.4.8
+pycodestyle==2.8.0
+pycparser==2.20
+pydantic==1.8.2
+PyJWT==2.3.0
+pypika-tortoise==0.1.1
+python-dotenv==0.19.1
+python-jose==3.3.0
+python-multipart==0.0.5
+pytz==2021.3
+rsa==4.7.2
+six==1.16.0
+sniffio==1.2.0
+starlette==0.16.0
+toml==0.10.2
+tortoise-orm==0.17.8
+typing-extensions==3.10.0.2
+uvicorn==0.15.0
+```
+now use the following command to install these dependencies
+```
+pip install -r requirements.txt
+```
+now in `app/__init__.py`
+```py
+from fastapi import FastAPI
+from . import auth, todo
+from tortoise.contrib.fastapi import register_tortoise
+from dotenv import load_dotenv
+import os
+
+load_dotenv()
+
+app = FastAPI()
+app.include_router(auth.router)
+app.include_router(todo.router)
+
+@app.get("/")
+async def read_main():
+    return {"msg": "Hello World"}
+
+
+register_tortoise(
+    app,
+    db_url=os.environ.get("DATABASE_URL", "sqlite://db.sqlite3"),
+    modules={"models": ["app.models"]},
+    generate_schemas=True,
+    add_exception_handlers=True
+)
+```
+Here we are basically setting up a basic fastapi app and setting up tortoise orm also some models and router we will be making soon
+Now in `app/models.py`,
+
+```py
+import os
+import jwt
+from datetime import datetime, timedelta
+from tortoise import fields, models
+from passlib.context import CryptContext
+
+from .exceptions import UserAlreadyExists
+from tortoise.contrib.pydantic import pydantic_model_creator
+from tortoise import Tortoise
+
+SECRET_KEY = os.environ["SECRET_KEY"]
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+
+class User(models.Model):
+    id = fields.IntField(pk=True)
+    username = fields.CharField(max_length=32, unique=True, null=False)
+    password_hash = fields.CharField(max_length=512, null=False)
+    created_at = fields.DatetimeField(auto_now_add=True)
+    modified_at = fields.DatetimeField(auto_now=True)
+
+    @classmethod
+    async def create_user(cls, username, password):
+        exists = await cls.filter(username=username).first()
+        if exists:
+            raise UserAlreadyExists
+        hashed_password = pwd_context.hash(password)
+        user = await cls.create(username=username, password_hash=hashed_password)
+        return user
+
+    async def verify_password(self, password):
+        return pwd_context.verify(password, self.password_hash)
+
+    @classmethod
+    async def authenticate_user(cls, username, password):
+        user = await cls.filter(username=username).first()
+        if user is None:
+            return False
+        if await user.verify_password(password):
+            return user
+        return None
+
+    async def create_access_token(self, expire_minutes=5, **data):
+        payload = data.copy()
+        expire = datetime.utcnow() + timedelta(minutes=expire_minutes)
+        payload.update({"user_id": self.id})
+        payload.update({"exp": expire})
+        encoded_jwt = jwt.encode(payload, SECRET_KEY, "HS256")
+        return encoded_jwt
+
+    class PydanticMeta:
+        exclude = ["password_hash"]
+
+Tortoise.init_models(["app.models"], "models")
+
+user_pydantic = pydantic_model_creator(User, name="user")
+```
+
+Here we are making a User model for tortoise orm. Here we are using passlib for password hashing.
+and finally creating pydantic models for using it with fastapi. We use `User.create_access_token` for generating jwt
+
+Now in `exceptions.py`
+
+```py
+class UserAlreadyExists(BaseException):
+    """
+    The user already exists. 
+    """
+    pass
+```
+Here we are creating an exception that's to be raised where there is an attempt to create a username with already existing username
+
+Now in `auth.py`
+```py
+import os
+import jwt
+from dotenv import load_dotenv
+from fastapi import APIRouter, HTTPException, Depends, status
+from .models import User, user_pydantic
+from pydantic import BaseModel
+from .exceptions import UserAlreadyExists
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from datetime import datetime, timedelta
+from jose import JWTError
+
+load_dotenv
+
+SECRET_KEY = os.environ["SECRET_KEY"]
+
+jwt_scheme = OAuth2PasswordBearer(tokenUrl="token")
+
+router = APIRouter(tags=["auth"])
+
+
+class RegisterModel(BaseModel):
+    username: str
+    password: str
+
+
+class Token(BaseModel):
+    access_token: str
+    refresh_token: str
+    token_type: str
+
+
+class RefreshTokenModel(BaseModel):
+    refresh_token: str
+
+
+async def get_current_user(token: str = Depends(jwt_scheme)):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
+        if payload["type"] != "access":
+            raise credentials_exception
+        user_id = payload.get("user_id")
+        if user_id is None:
+            raise credentials_exception
+        user = await User.filter(id=user_id).first()
+        if user is None:
+            raise credentials_exception
+        return user
+    except JWTError:
+        raise credentials_exception
+    except:
+        raise credentials_exception
+
+
+@router.post("/register", status_code=201)
+async def register_user(data: RegisterModel):
+    username = data.username
+    password = data.password
+    try:
+        user = await User.create_user(username=username, password=password)
+        print("after user creating", user)
+        return await user_pydantic.from_tortoise_orm(user)
+    except UserAlreadyExists:
+        raise HTTPException(
+            status_code=403, detail="a user with same username already exists")
+    except:
+        return HTTPException(status_code=403, detail="an error has occured")
+
+
+@router.post("/token", response_model=Token)
+async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
+    user = await User.authenticate_user(form_data.username, form_data.password)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    access_token = await user.create_access_token(type="access", expire_minutes=30)
+    refresh_token = await user.create_access_token(expire_minutes=3200, type="refresh")
+    return {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "token_type": "Bearer"
+    }
+
+
+@router.post("/token/refresh", response_model=Token)
+async def refresh_token(data: RefreshTokenModel):
+    token = data.refresh_token
+    payload = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
+    if payload["type"] != "refresh":
+        raise HTTPException(401, "token passed is not a refresh token")
+    user_id = payload.get("user_id")
+    user = await User.filter(id=user_id).first()
+    if user:
+        access_token = await user.create_access_token(type="access")
+        refresh_token = await user.create_access_token(expire_minutes=3200, type="refresh")
+        return {
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "token_type": "Bearer"
+        }
+
+
+@router.get("/protected", response_model=user_pydantic)
+async def test(user: User = Depends(get_current_user)):
+    return await user_pydantic.from_tortoise_orm(user)
+```
+
+Here we are handling all routes including token generation, token refreshing etc 
+also a protected route to check if it works.
